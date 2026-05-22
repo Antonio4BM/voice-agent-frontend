@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react';
 import './panel.css';
-import { Play, Square } from 'lucide-react';
+import { Play, Square, StopCircle} from 'lucide-react';
+import { MicVAD } from "@ricky0123/vad-web"
 
 const OFFER_URL = 'http://localhost:8080/offer';
 
@@ -24,6 +25,9 @@ function Panel() {
   const sampleWidth = useRef<number | null>(null);
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const vadRef = useRef<MicVAD | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const userSpeakingRef = useRef(false);
 
   function concatChunks(chunks: Uint8Array[]) {
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -34,6 +38,18 @@ function Panel() {
       offset += chunk.length;
     }
     return merged;
+  }
+
+  function removeAudioSource(){
+    if (audioSourceRef.current) {
+      try{
+        audioSourceRef.current.stop();
+      }catch(error){
+        console.log("audio source already stopped");
+      }
+      audioSourceRef.current.disconnect();
+      audioSourceRef.current = null;
+    }
   }
 
   async function playPcm16(bytes: Uint8Array, sampleRate: number, channels: number) {
@@ -53,7 +69,9 @@ function Panel() {
         audioBuffer.getChannelData(ch)[i] = sample / 32768;
       }
     }
+    removeAudioSource(); // remove any existing audio source
     const source = audioContext.createBufferSource();
+    audioSourceRef.current = source;
     source.buffer = audioBuffer;
     source.connect(audioContext.destination);
     source.start();
@@ -72,7 +90,6 @@ function Panel() {
   }
 
   async function handleMessageFromAgent(event: MessageEvent) {
-    console.log('Message from agent:', event.data);
     try{
       if (typeof event.data === 'string') {
         const agentmetadata = JSON.parse(event.data);
@@ -82,6 +99,10 @@ function Panel() {
           sampleWidth.current = agentmetadata.sample_width ?? null;
           audioChunksRef.current = [];
         } else if (agentmetadata.type === 'audio_end'){
+          if (userSpeakingRef.current) {
+            audioChunksRef.current = [];
+            return; // if the user is speaking, don't play the audio
+          }
           const merged = concatChunks(audioChunksRef.current);
           audioChunksRef.current = [];
           if (sampleRate.current && channels.current && sampleWidth.current === 2) {
@@ -94,7 +115,8 @@ function Panel() {
             });
           }
         }
-      }else{
+      }else{ // if the message is not a string, it is audio data
+        if (userSpeakingRef.current) return; // if the user is speaking, don't add the audio chunks
         audioChunksRef.current.push(new Uint8Array(event.data));
       }
     } catch(error) {
@@ -116,19 +138,26 @@ function Panel() {
     };
   }
 
-  function cleanup() {
+  async function cleanup() {
     dcRef.current = null;
     pendingStopSignalRef.current = false;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    if (vadRef.current) {
+      await vadRef.current.destroy()
+      vadRef.current = null;
+    }
     if (pcRef.current) {
       pcRef.current.close();
       pcRef.current = null;
     }
+    removeAudioSource();
     setIsSession(false);
     setIsSendingAudio(false);
+    setStatus('Connection closed.');
+    userSpeakingRef.current = false;
   }
 
   async function getStream(){
@@ -151,8 +180,72 @@ function Panel() {
     return stream;
   }
 
+  async function createVAD(){
+
+    const vad = await MicVAD.new({
+      model: "v5",     
+      baseAssetPath: "/vad/",
+      onnxWASMBasePath: "/vad/",
+      startOnLoad: false, // prevent vad from starting automatically
+      getStream: async() => {
+        const stream_aux = streamRef.current;
+        if (!stream_aux){
+          throw new Error("Stream not found");
+        }
+        return stream_aux;
+      },
+      pauseStream: async (stream_aux: MediaStream) => {
+        stream_aux.getTracks().forEach((t) => {t.enabled = false;});
+      },
+      resumeStream: async (stream_aux: MediaStream) => {
+        stream_aux.getTracks().forEach((t) => {t.enabled = true});
+        return stream_aux;
+      },
+      onSpeechRealStart: () => {
+        console.log("Speech started");
+        userSpeakingRef.current = true;
+        audioChunksRef.current = [];
+        removeAudioSource();
+        const dc = dcRef.current;
+        if (dc?.readyState === 'open') {
+          try {
+            dc.send(STOP_SIGNAL_JSON);
+          } catch {
+            console.log('Error sending stop signal');
+          }
+        }
+      },
+      onSpeechEnd: () => {
+        console.log("Speech ended");
+        userSpeakingRef.current = false;
+      }
+    });
+
+    return vad;
+
+  }
+
   async function handleStart() {
     try {
+      // verify if there is an active session
+      if (pcRef.current && streamRef.current && isSession){
+
+        // unmute the microphone
+        for (const t of streamRef.current.getAudioTracks()){
+          t.enabled = true;
+        }
+
+        // check if vad is already initialized
+        if (!vadRef.current){
+          vadRef.current = await createVAD();
+        }
+        await vadRef.current.start();
+
+        setIsSendingAudio(true);
+        setStatus('Recording… Audio is being sent to the server.');
+        return;
+
+      }
 
       const stream = await getStream();
 
@@ -167,6 +260,12 @@ function Panel() {
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+
+      // check if vad is already initialized
+      if (!vadRef.current){
+        vadRef.current = await createVAD();
+      }
+      await vadRef.current.start();
 
       const response = await fetch(OFFER_URL, {
         method: 'POST',
@@ -190,16 +289,14 @@ function Panel() {
       setStatus('Recording… Audio is being sent to the server.');
     } catch (err) {
       setStatus('Stopped.');
-      cleanup();
+      await cleanup();
     }
   }
 
-  function handleStop() {
-    const stream = streamRef.current;
-    if (stream) {
-      for (const t of stream.getAudioTracks()) {
-        t.enabled = false;
-      }
+  async function handlePuase() {
+    const vad = vadRef.current;
+    if(vad){
+      await vad.pause();
     }
     const dc = dcRef.current;
     if (dc?.readyState === 'open') {
@@ -226,9 +323,13 @@ function Panel() {
           <Play size={16} />
           <span>Start</span>
         </button>
-        <button onClick={handleStop} disabled={stopDisabled}>
+        <button onClick={cleanup} disabled={stopDisabled}>
           <Square size={16} />
           <span>Stop</span>
+        </button>
+        <button onClick={handlePuase} disabled={!isSession}>
+          <StopCircle size={16}/>
+          <span>Pause</span>
         </button>
       </div>
       <p className="panel-status">{status}</p>
