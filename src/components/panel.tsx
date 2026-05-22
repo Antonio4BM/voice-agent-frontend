@@ -156,6 +156,8 @@ function Panel() {
     removeAudioSource();
     setIsSession(false);
     setIsSendingAudio(false);
+    setStatus('Connection closed.');
+    userSpeakingRef.current = false;
   }
 
   async function getStream(){
@@ -204,9 +206,17 @@ function Panel() {
         userSpeakingRef.current = true;
         audioChunksRef.current = [];
         removeAudioSource();
+        const dc = dcRef.current;
+        if (dc?.readyState === 'open') {
+          try {
+            dc.send(STOP_SIGNAL_JSON);
+          } catch {
+            console.log('Error sending stop signal');
+          }
+        }
       },
       onSpeechEnd: () => {
-        console.log("Speech");
+        console.log("Speech ended");
         userSpeakingRef.current = false;
       }
     });
