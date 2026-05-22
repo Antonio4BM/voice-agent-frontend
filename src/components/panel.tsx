@@ -26,6 +26,8 @@ function Panel() {
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const vadRef = useRef<MicVAD | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const userSpeakingRef = useRef(false);
 
   function concatChunks(chunks: Uint8Array[]) {
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -36,6 +38,18 @@ function Panel() {
       offset += chunk.length;
     }
     return merged;
+  }
+
+  function removeAudioSource(){
+    if (audioSourceRef.current) {
+      try{
+        audioSourceRef.current.stop();
+      }catch(error){
+        console.log("audio source already stopped");
+      }
+      audioSourceRef.current.disconnect();
+      audioSourceRef.current = null;
+    }
   }
 
   async function playPcm16(bytes: Uint8Array, sampleRate: number, channels: number) {
@@ -55,7 +69,9 @@ function Panel() {
         audioBuffer.getChannelData(ch)[i] = sample / 32768;
       }
     }
+    removeAudioSource(); // remove any existing audio source
     const source = audioContext.createBufferSource();
+    audioSourceRef.current = source;
     source.buffer = audioBuffer;
     source.connect(audioContext.destination);
     source.start();
@@ -74,7 +90,6 @@ function Panel() {
   }
 
   async function handleMessageFromAgent(event: MessageEvent) {
-    console.log('Message from agent:', event.data);
     try{
       if (typeof event.data === 'string') {
         const agentmetadata = JSON.parse(event.data);
@@ -84,6 +99,10 @@ function Panel() {
           sampleWidth.current = agentmetadata.sample_width ?? null;
           audioChunksRef.current = [];
         } else if (agentmetadata.type === 'audio_end'){
+          if (userSpeakingRef.current) {
+            audioChunksRef.current = [];
+            return; // if the user is speaking, don't play the audio
+          }
           const merged = concatChunks(audioChunksRef.current);
           audioChunksRef.current = [];
           if (sampleRate.current && channels.current && sampleWidth.current === 2) {
@@ -96,7 +115,8 @@ function Panel() {
             });
           }
         }
-      }else{
+      }else{ // if the message is not a string, it is audio data
+        if (userSpeakingRef.current) return; // if the user is speaking, don't add the audio chunks
         audioChunksRef.current.push(new Uint8Array(event.data));
       }
     } catch(error) {
@@ -133,6 +153,7 @@ function Panel() {
       pcRef.current.close();
       pcRef.current = null;
     }
+    removeAudioSource();
     setIsSession(false);
     setIsSendingAudio(false);
   }
@@ -178,8 +199,15 @@ function Panel() {
         stream_aux.getTracks().forEach((t) => {t.enabled = true});
         return stream_aux;
       },
+      onSpeechRealStart: () => {
+        console.log("Speech started");
+        userSpeakingRef.current = true;
+        audioChunksRef.current = [];
+        removeAudioSource();
+      },
       onSpeechEnd: () => {
         console.log("Speech");
+        userSpeakingRef.current = false;
       }
     });
 
@@ -285,11 +313,11 @@ function Panel() {
           <Play size={16} />
           <span>Start</span>
         </button>
-        <button disabled={stopDisabled}>
+        <button onClick={cleanup} disabled={stopDisabled}>
           <Square size={16} />
           <span>Stop</span>
         </button>
-        <button onClick={handlePuase} disabled={stopDisabled}>
+        <button onClick={handlePuase} disabled={!isSession}>
           <StopCircle size={16}/>
           <span>Pause</span>
         </button>
