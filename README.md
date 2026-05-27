@@ -133,8 +133,6 @@ Multi-stage `Dockerfile`: Node 22 builds the Vite app; nginx serves `dist/`.
 
 ## Notes and limitations
 
-- The signaling endpoint URL is hardcoded in `panel.tsx` (`http://localhost:8080/offer`).
 - Microphone permission is required in the browser.
-- Data channel messages are parsed as JSON or binary without strict schema validation.
 - Agent audio playback supports PCM16 only (`sample_width === 2`).
-- VAD uses model `v5` with assets served from `/vad/` (dev and production builds must include those files).
+- VAD uses model `v5` with assets served from `/vad/`
