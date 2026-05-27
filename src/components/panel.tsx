@@ -1,14 +1,18 @@
 import { useState, useRef } from 'react';
 import './panel.css';
 import { Play, Square, StopCircle} from 'lucide-react';
-import { MicVAD } from "@ricky0123/vad-web"
+import { MicVAD } from "@ricky0123/vad-web";
+import { AgentMessageSchema, StopSignalSchema } from '../protocol/agent-messages';
+import { toUint8Array, isAlignedPcmChunk} from '../protocol/pcm';
 
-const OFFER_URL = 'http://localhost:8080/offer';
+const OFFER_URL = import.meta.env.VITE_OFFER_URL;
 
-const STOP_SIGNAL_JSON = JSON.stringify({
-  type: 'signal',
-  action: 'stop_audio',
-});
+const STOP_SIGNAL_JSON = JSON.stringify(
+  StopSignalSchema.parse({
+    type: 'signal',
+    action: 'stop_audio',
+  })
+);
 
 function Panel() {
   const [status, setStatus] = useState('Stopped.');
@@ -28,6 +32,7 @@ function Panel() {
   const vadRef = useRef<MicVAD | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const userSpeakingRef = useRef(false);
+  const isReceivingAudioRef = useRef(false);
 
   function concatChunks(chunks: Uint8Array[]) {
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -45,7 +50,7 @@ function Panel() {
       try{
         audioSourceRef.current.stop();
       }catch(error){
-        console.log("audio source already stopped");
+        console.error("audio source already stopped");
       }
       audioSourceRef.current.disconnect();
       audioSourceRef.current = null;
@@ -84,7 +89,7 @@ function Panel() {
       try {
         dc.send(STOP_SIGNAL_JSON);
       } catch(error) {
-        console.log("Error sending stop signal", error);
+        console.error("Error sending stop signal", error);
       }
     }
   }
@@ -92,23 +97,41 @@ function Panel() {
   async function handleMessageFromAgent(event: MessageEvent) {
     try{
       if (typeof event.data === 'string') {
-        const agentmetadata = JSON.parse(event.data);
+        let json: unknown;
+        try {
+          json = JSON.parse(event.data);
+        }catch(error){
+          console.error("Error parsing message from agent", error);
+          return;
+        }
+        const parserResult = AgentMessageSchema.safeParse(json);
+        if (!parserResult.success) {
+          console.error("Error parsing message from agent", parserResult.error);
+          return;
+        }
+        const agentmetadata = parserResult.data;
         if (agentmetadata.type === 'audio_start'){
-          sampleRate.current = agentmetadata.sample_rate ?? null;
-          channels.current = agentmetadata.channels ?? null;
-          sampleWidth.current = agentmetadata.sample_width ?? null;
+          isReceivingAudioRef.current = true;
+          sampleRate.current = agentmetadata.sample_rate;
+          channels.current = agentmetadata.channels;
+          sampleWidth.current = agentmetadata.sample_width;
           audioChunksRef.current = [];
-        } else if (agentmetadata.type === 'audio_end'){
-          if (userSpeakingRef.current) {
+        } else if (agentmetadata.type === 'audio_end'){ // the agent is done sending audio
+          isReceivingAudioRef.current = false;
+          sampleRate.current = null;
+          channels.current = null;
+          sampleWidth.current = null;
+          if (userSpeakingRef.current) { // if the user is speaking, don't play the audio
             audioChunksRef.current = [];
-            return; // if the user is speaking, don't play the audio
+            return;
           }
           const merged = concatChunks(audioChunksRef.current);
           audioChunksRef.current = [];
-          if (sampleRate.current && channels.current && sampleWidth.current === 2) {
+          if (merged.length === 0) return; // if the merged audio is empty, don't play it
+          if (sampleRate.current && channels.current) {
             await playPcm16(merged, sampleRate.current, channels.current);
           } else {
-            console.log('Unsupported audio metadata', {
+            console.error('Unsupported audio metadata', {
               sampleRate: sampleRate.current,
               channels: channels.current,
               sampleWidth: sampleWidth.current,
@@ -117,10 +140,32 @@ function Panel() {
         }
       }else{ // if the message is not a string, it is audio data
         if (userSpeakingRef.current) return; // if the user is speaking, don't add the audio chunks
-        audioChunksRef.current.push(new Uint8Array(event.data));
+
+        if (!isReceivingAudioRef.current) {
+          console.warn("Received audio data while not receiving audio");
+          return;
+        }
+
+        if (channels.current == null || sampleWidth.current == null) {
+          console.warn('Received audio data while not receiving audio metadata');
+          return;
+        }
+
+        const bytes = toUint8Array(event.data);
+        if (bytes == null) {
+          console.warn('Received invalid audio data');
+          return;
+        }
+
+        if (!isAlignedPcmChunk(bytes, channels.current, sampleWidth.current)) {
+          console.warn('Received audio data that is not aligned with the audio metadata');
+          return;
+        }
+
+        audioChunksRef.current.push(bytes);
       }
     } catch(error) {
-      console.log("Error parsing message from agent", error);
+      console.error("Error parsing message from agent", error);
     }
   }
 
@@ -158,6 +203,11 @@ function Panel() {
     setIsSendingAudio(false);
     setStatus('Connection closed.');
     userSpeakingRef.current = false;
+    isReceivingAudioRef.current = false;
+    sampleRate.current = null;
+    channels.current = null;
+    sampleWidth.current = null;
+    audioChunksRef.current = [];
   }
 
   async function getStream(){
@@ -205,13 +255,14 @@ function Panel() {
         console.log("Speech started");
         userSpeakingRef.current = true;
         audioChunksRef.current = [];
+        isReceivingAudioRef.current = false;
         removeAudioSource();
         const dc = dcRef.current;
         if (dc?.readyState === 'open') {
           try {
             dc.send(STOP_SIGNAL_JSON);
           } catch {
-            console.log('Error sending stop signal');
+            console.error('Error sending stop signal');
           }
         }
       },
@@ -303,12 +354,14 @@ function Panel() {
       try {
         dc.send(STOP_SIGNAL_JSON);
       } catch {
-        console.log('Error sending stop signal');
+        console.error('Error sending stop signal');
       }
     } else {
       pendingStopSignalRef.current = true;
     }
     setIsSendingAudio(false);
+    isReceivingAudioRef.current = false;
+    audioChunksRef.current = [];
     setStatus('Audio muted — connection stays open.');
   }
 
