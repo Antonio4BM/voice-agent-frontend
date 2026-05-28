@@ -2,17 +2,25 @@ import { useState, useRef } from 'react';
 import './panel.css';
 import { Play, Square, StopCircle} from 'lucide-react';
 import { MicVAD } from "@ricky0123/vad-web";
-import { AgentMessageSchema, StopSignalSchema } from '../protocol/agent-messages';
+import { ResumeSignalSchema, InterruptSignalSchema, parseAgentMessage} from '../protocol/agent-messages';
 import { toUint8Array, isAlignedPcmChunk} from '../protocol/pcm';
 
 const OFFER_URL = import.meta.env.VITE_OFFER_URL;
 
-const STOP_SIGNAL_JSON = JSON.stringify(
-  StopSignalSchema.parse({
+const RESUME_SIGNAL_JSON = JSON.stringify(
+  ResumeSignalSchema.parse({
     type: 'signal',
-    action: 'stop_audio',
+    action: 'resume_audio',
   })
 );
+
+const INTERRUPT_SIGNAL_JSON = JSON.stringify(
+  InterruptSignalSchema.parse({
+    type: 'signal',
+    action: 'interrupt_audio',
+  })
+);
+type PendingControl = 'interrupt' | 'resume' | null;
 
 function Panel() {
   const [status, setStatus] = useState('Stopped.');
@@ -23,7 +31,6 @@ function Panel() {
   const streamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
-  const pendingStopSignalRef = useRef(false);
   const sampleRate = useRef<number | null>(null);
   const channels = useRef<number | null>(null);
   const sampleWidth = useRef<number | null>(null);
@@ -33,6 +40,7 @@ function Panel() {
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const userSpeakingRef = useRef(false);
   const isReceivingAudioRef = useRef(false);
+  const pendingControlRef = useRef<PendingControl>(null);
 
   function concatChunks(chunks: Uint8Array[]) {
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -82,42 +90,57 @@ function Panel() {
     source.start();
   }
 
-  function handleOpenDataChannelInterruption(dc: RTCDataChannel, pendingStopSignalRef: { current: boolean }) {
-    // check if there is a pending stop signal
-    if (pendingStopSignalRef.current) {
-      pendingStopSignalRef.current = false;
+  function sendOrQueueControl(dc: RTCDataChannel | null, action: 'interrupt' | 'resume') {
+    const payload = action === 'interrupt' ? INTERRUPT_SIGNAL_JSON : RESUME_SIGNAL_JSON;
+  
+    if (dc?.readyState === 'open') {
       try {
-        dc.send(STOP_SIGNAL_JSON);
-      } catch(error) {
-        console.error("Error sending stop signal", error);
+        dc.send(payload);
+        pendingControlRef.current = null;
+        return;
+      } catch {
+        // fall through to queue
       }
+    }
+  
+    // channel not open or send failed: queue latest intent
+    pendingControlRef.current = action;
+  }
+
+  function flushPendingControlOnOpen(dc: RTCDataChannel) {
+    const pending = pendingControlRef.current;
+    if (!pending) return;
+  
+    const payload = pending === 'interrupt' ? INTERRUPT_SIGNAL_JSON : RESUME_SIGNAL_JSON;
+    try {
+      dc.send(payload);
+      pendingControlRef.current = null;
+    } catch {
+      // keep pending for a future reopen
     }
   }
 
   async function handleMessageFromAgent(event: MessageEvent) {
     try{
       if (typeof event.data === 'string') {
-        let json: unknown;
-        try {
-          json = JSON.parse(event.data);
-        }catch(error){
-          console.error("Error parsing message from agent", error);
+        const parseResult = parseAgentMessage(event.data);
+        if (!parseResult.success){
+          console.error('Error parsing message', parseResult.error, parseResult.cause);
           return;
         }
-        const parserResult = AgentMessageSchema.safeParse(json);
-        if (!parserResult.success) {
-          console.error("Error parsing message from agent", parserResult.error);
-          return;
-        }
-        const agentmetadata = parserResult.data;
-        if (agentmetadata.type === 'audio_start'){
+        const agentMessage = parseResult.data;
+        if (agentMessage.type === 'audio_start'){
           isReceivingAudioRef.current = true;
-          sampleRate.current = agentmetadata.sample_rate;
-          channels.current = agentmetadata.channels;
-          sampleWidth.current = agentmetadata.sample_width;
+          sampleRate.current = agentMessage.sample_rate;
+          channels.current = agentMessage.channels;
+          sampleWidth.current = agentMessage.sample_width;
           audioChunksRef.current = [];
-        } else if (agentmetadata.type === 'audio_end'){ // the agent is done sending audio
+        } else if (agentMessage.type === 'audio_end'){ // the agent is done sending audio
           isReceivingAudioRef.current = false;
+          
+          const temp_rate = sampleRate.current;
+          const temp_channels = channels.current;
+
           sampleRate.current = null;
           channels.current = null;
           sampleWidth.current = null;
@@ -128,15 +151,11 @@ function Panel() {
           const merged = concatChunks(audioChunksRef.current);
           audioChunksRef.current = [];
           if (merged.length === 0) return; // if the merged audio is empty, don't play it
-          if (sampleRate.current && channels.current) {
-            await playPcm16(merged, sampleRate.current, channels.current);
-          } else {
-            console.error('Unsupported audio metadata', {
-              sampleRate: sampleRate.current,
-              channels: channels.current,
-              sampleWidth: sampleWidth.current,
-            });
-          }
+          if (temp_rate == null || temp_channels == null) {
+            console.error('audio_end without audio_start');
+            return;
+          } 
+          await playPcm16(merged, temp_rate, temp_channels);
         }
       }else{ // if the message is not a string, it is audio data
         if (userSpeakingRef.current) return; // if the user is speaking, don't add the audio chunks
@@ -172,11 +191,10 @@ function Panel() {
 
   function attachDataChannel(
     dc: RTCDataChannel,
-    pendingStopSignalRef: { current: boolean },
     dcRef: { current: RTCDataChannel | null },
   ) {
     dcRef.current = dc;
-    dc.onopen = () => handleOpenDataChannelInterruption(dc, pendingStopSignalRef);
+    dc.onopen = () => flushPendingControlOnOpen(dc);
     dc.onmessage = (event) => handleMessageFromAgent(event);
     dc.onclose = () => {
       if (dcRef.current === dc) dcRef.current = null;
@@ -185,7 +203,6 @@ function Panel() {
 
   async function cleanup() {
     dcRef.current = null;
-    pendingStopSignalRef.current = false;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -208,6 +225,7 @@ function Panel() {
     channels.current = null;
     sampleWidth.current = null;
     audioChunksRef.current = [];
+    pendingControlRef.current = null;
   }
 
   async function getStream(){
@@ -258,17 +276,13 @@ function Panel() {
         isReceivingAudioRef.current = false;
         removeAudioSource();
         const dc = dcRef.current;
-        if (dc?.readyState === 'open') {
-          try {
-            dc.send(STOP_SIGNAL_JSON);
-          } catch {
-            console.error('Error sending stop signal');
-          }
-        }
+        sendOrQueueControl(dc, 'interrupt');
       },
       onSpeechEnd: () => {
         console.log("Speech ended");
         userSpeakingRef.current = false;
+        const dc = dcRef.current;
+        sendOrQueueControl(dc, 'resume');
       }
     });
 
@@ -307,7 +321,7 @@ function Panel() {
 
       // data channel for voice agent 
       const dc = pc.createDataChannel('voice-agent', { ordered: true });
-      attachDataChannel(dc, pendingStopSignalRef, dcRef);
+      attachDataChannel(dc, dcRef);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -344,21 +358,13 @@ function Panel() {
     }
   }
 
-  async function handlePuase() {
+  async function handleMuteAndResumeAgent() {
     const vad = vadRef.current;
     if(vad){
       await vad.pause();
     }
     const dc = dcRef.current;
-    if (dc?.readyState === 'open') {
-      try {
-        dc.send(STOP_SIGNAL_JSON);
-      } catch {
-        console.error('Error sending stop signal');
-      }
-    } else {
-      pendingStopSignalRef.current = true;
-    }
+    sendOrQueueControl(dc, 'resume');
     setIsSendingAudio(false);
     isReceivingAudioRef.current = false;
     audioChunksRef.current = [];
@@ -380,9 +386,9 @@ function Panel() {
           <Square size={16} />
           <span>Stop</span>
         </button>
-        <button onClick={handlePuase} disabled={!isSession}>
+        <button onClick={handleMuteAndResumeAgent} disabled={!isSession}>
           <StopCircle size={16}/>
-          <span>Pause</span>
+          <span>Mute Mic</span>
         </button>
       </div>
       <p className="panel-status">{status}</p>
