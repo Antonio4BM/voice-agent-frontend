@@ -21,9 +21,19 @@ const AudioEndSchema = z.object({
     type: z.literal('audio_end')
 });
 
+const AudioAbortSchema = z.object({
+  type: z.literal('audio_abort')
+});
+
+const SentenceAudioEndSchema = z.object({
+  type: z.literal('sentence_audio_end')
+});
+
 const AgentMessageSchema = z.discriminatedUnion('type', [
     AudioStartSchema,
     AudioEndSchema,
+    AudioAbortSchema,
+    SentenceAudioEndSchema,
 ]);
 
 export type AgentMessage = z.infer<typeof AgentMessageSchema>;
