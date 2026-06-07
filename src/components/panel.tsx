@@ -1,36 +1,13 @@
 import { useState, useRef } from 'react';
 import './panel.css';
-import { Play, Square, StopCircle} from 'lucide-react';
 import { MicVAD } from "@ricky0123/vad-web";
-import { ResumeSignalSchema, InterruptSignalSchema, parseAgentMessage} from '../protocol/agent-messages';
+import { Play, Square, StopCircle} from 'lucide-react';
+import UseWebRTCSession from '../hooks/use-webrtc-session';
 import { toUint8Array, isAlignedPcmChunk} from '../protocol/pcm';
-
-const OFFER_URL = import.meta.env.VITE_OFFER_URL;
-
-const RESUME_SIGNAL_JSON = JSON.stringify(
-  ResumeSignalSchema.parse({
-    type: 'signal',
-    action: 'resume_audio',
-  })
-);
-
-const INTERRUPT_SIGNAL_JSON = JSON.stringify(
-  InterruptSignalSchema.parse({
-    type: 'signal',
-    action: 'interrupt_audio',
-  })
-);
-type PendingControl = 'interrupt' | 'resume' | null;
+import { parseAgentMessage} from '../protocol/agent-messages';
 
 function Panel() {
   const [status, setStatus] = useState('Stopped.');
-  /** Negotiated WebRTC session (PC + mic stream). */
-  const [isSession, setIsSession] = useState(false);
-  /** Audio track is enabled and RTP is being sent. */
-  const [isSendingAudio, setIsSendingAudio] = useState(false);
-  const streamRef = useRef<MediaStream | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const dcRef = useRef<RTCDataChannel | null>(null);
   const sampleRate = useRef<number | null>(null);
   const channels = useRef<number | null>(null);
   const sampleWidth = useRef<number | null>(null);
@@ -40,140 +17,49 @@ function Panel() {
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const userSpeakingRef = useRef(false);
   const isReceivingAudioRef = useRef(false);
-  const pendingControlRef = useRef<PendingControl>(null);
   const utteranceAbortedRef = useRef(false);
   const playBackQueueRef = useRef<{bytes: Uint8Array, sampleRate: number, channels: number}[]>([]);
   const isPlayingRef = useRef(false);
   const turnEndedRef = useRef(false);
+  const { isSession, isSendingAudio, streamRef, sendControl, setIsSendingAudio, handleStart, cleanup } = UseWebRTCSession({
+    handleMessageFromAgent: handleMessageFromAgent,
+    setStatus: setStatus,
+    onSessionEnd: onSessionEnd,
+    startVAD: startVAD,
+  });
+
+  async function startVAD(){
+    if (!vadRef.current){
+      vadRef.current = await createVAD();
+    }
+    await vadRef.current.start();
+  }
+
+  async function onSessionEnd(){
+    removeAudioSource();
+    cleanupAudioState();
+    if (vadRef.current) {
+      await vadRef.current.destroy()
+      vadRef.current = null;
+    }
+    audioChunksRef.current = [];
+    utteranceAbortedRef.current = false;
+    playBackQueueRef.current = [];
+    isPlayingRef.current = false;
+    turnEndedRef.current = false;
+    userSpeakingRef.current = false;
+    isReceivingAudioRef.current = false;
+  }
 
   function concatChunks(chunks: Uint8Array[]) {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return merged;
-  }
-
-  function removeAudioSource(){
-    if (audioSourceRef.current) {
-      try{
-        audioSourceRef.current.stop();
-      }catch(error){
-        console.error("audio source already stopped");
+      const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
       }
-      audioSourceRef.current.disconnect();
-      audioSourceRef.current = null;
-    }
-  }
-
-  async function playOneSentence(bytes: Uint8Array, sampleRate: number, channels: number) {
-    const audioContext =
-      audioContextRef.current ?? new AudioContext();
-    audioContextRef.current = audioContext;
-    if (audioContext.state === 'suspended') {
-      await audioContext.resume();
-    }
-    if (userSpeakingRef.current || utteranceAbortedRef.current) return false; // if the user is speaking, don't play the audio
-    
-    const sampleCount = bytes.length / 2 / channels;
-    const audioBuffer = audioContext.createBuffer(channels, sampleCount, sampleRate);
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    for (let i = 0; i < sampleCount; i++) {
-      for (let ch = 0; ch < channels; ch++) {
-        const byteOffset = (i * channels + ch) * 2;
-        const sample = view.getInt16(byteOffset, true); // little-endian PCM16
-        audioBuffer.getChannelData(ch)[i] = sample / 32768;
-      }
-    }
-
-    const source = audioContext.createBufferSource();
-    audioSourceRef.current = source;
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    
-    source.onended = () => {
-      if(audioSourceRef.current === source) audioSourceRef.current = null;
-      isPlayingRef.current = false;
-      void drainPlaybackQueue();
-    }
-
-    if (userSpeakingRef.current || utteranceAbortedRef.current) return false; // if the user is speaking, don't start the audio source
-    source.start();
-    return true;
-  }
-
-  function sendOrQueueControl(dc: RTCDataChannel | null, action: 'interrupt' | 'resume') {
-    const payload = action === 'interrupt' ? INTERRUPT_SIGNAL_JSON : RESUME_SIGNAL_JSON;
-  
-    if (dc?.readyState === 'open') {
-      try {
-        dc.send(payload);
-        pendingControlRef.current = null;
-        return;
-      } catch(error){
-        console.error("Error sending control signal", error);
-      }
-    }
-  
-    // channel not open or send failed: queue latest intent
-    pendingControlRef.current = action;
-  }
-
-  function maybeFinishTurn() {
-    if (!turnEndedRef.current) return;
-    if (isPlayingRef.current) return;
-    if (playBackQueueRef.current.length > 0) return;
-    removeAudioSource(); // safe: idle + queue empty + turn over
-  }
-
-  function flushPendingControlOnOpen(dc: RTCDataChannel) {
-    const pending = pendingControlRef.current;
-    if (!pending) return;
-  
-    const payload = pending === 'interrupt' ? INTERRUPT_SIGNAL_JSON : RESUME_SIGNAL_JSON;
-    try {
-      dc.send(payload);
-      pendingControlRef.current = null;
-    } catch {
-      // keep pending for a future reopen
-    }
-  }
-
-  function cleanupAudioState(){
-    sampleRate.current = null;
-    channels.current = null;
-    sampleWidth.current = null;
-  }
-
-  function enqueueAudio(merged: Uint8Array, sampleRate: number, channels: number){
-    if (merged.length === 0) return;
-    playBackQueueRef.current.push({
-      bytes: merged,
-      sampleRate: sampleRate,
-      channels: channels,
-    });
-    void drainPlaybackQueue();
-  }
-
-  async function drainPlaybackQueue() {
-    if (isPlayingRef.current) return;
-    if (userSpeakingRef.current || utteranceAbortedRef.current) return;
-  
-    const next = playBackQueueRef.current.shift();
-    if (!next) {
-      maybeFinishTurn();
-      return;
-    }
-  
-    isPlayingRef.current = true;
-    const started = await playOneSentence(next.bytes, next.sampleRate, next.channels);
-    if (!started) {
-      isPlayingRef.current = false;
-      void drainPlaybackQueue(); // try next item or finish
-    }
+      return merged;
   }
 
   async function handleMessageFromAgent(event: MessageEvent) {
@@ -264,70 +150,63 @@ function Panel() {
     }
   }
 
-
-  function attachDataChannel(
-    dc: RTCDataChannel,
-    dcRef: { current: RTCDataChannel | null },
-  ) {
-    dcRef.current = dc;
-    dc.onopen = () => flushPendingControlOnOpen(dc);
-    dc.onmessage = (event) => handleMessageFromAgent(event);
-    dc.onclose = () => {
-      if (dcRef.current === dc) dcRef.current = null;
-    };
-  }
-
-  async function cleanup() {
-    dcRef.current = null;
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (vadRef.current) {
-      await vadRef.current.destroy()
-      vadRef.current = null;
-    }
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    removeAudioSource();
-    setIsSession(false);
-    setIsSendingAudio(false);
-    setStatus('Connection closed.');
-    userSpeakingRef.current = false;
-    isReceivingAudioRef.current = false;
-    cleanupAudioState();
-    audioChunksRef.current = [];
-    pendingControlRef.current = null;
-    utteranceAbortedRef.current = false;
-    playBackQueueRef.current = [];
-    isPlayingRef.current = false;
-    turnEndedRef.current = false;
-  }
-
-  async function getStream(){
-    setStatus('Getting microphone…');
-    // if the stream is already open, return it
-    if (pcRef.current && streamRef.current) {
-      for (const t of streamRef.current.getAudioTracks()) {
-        t.enabled = true;
+  function removeAudioSource(){
+    if (audioSourceRef.current) {
+      try{
+        audioSourceRef.current.stop();
+      }catch(error){
+        console.error("audio source already stopped");
       }
-      setIsSendingAudio(true);
-      setStatus('Recording… Audio is being sent to the server.');
-      return streamRef.current;
+      audioSourceRef.current.disconnect();
+      audioSourceRef.current = null;
     }
-    // if the stream is not open, get it from the microphone
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: false,
-    });
-    streamRef.current = stream;
-    return stream;
+  }
+
+  async function playOneSentence(bytes: Uint8Array, sampleRate: number, channels: number) {
+    const audioContext =
+      audioContextRef.current ?? new AudioContext();
+    audioContextRef.current = audioContext;
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+    if (userSpeakingRef.current || utteranceAbortedRef.current) return false; // if the user is speaking, don't play the audio
+    
+    const sampleCount = bytes.length / 2 / channels;
+    const audioBuffer = audioContext.createBuffer(channels, sampleCount, sampleRate);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let i = 0; i < sampleCount; i++) {
+      for (let ch = 0; ch < channels; ch++) {
+        const byteOffset = (i * channels + ch) * 2;
+        const sample = view.getInt16(byteOffset, true); // little-endian PCM16
+        audioBuffer.getChannelData(ch)[i] = sample / 32768;
+      }
+    }
+
+    const source = audioContext.createBufferSource();
+    audioSourceRef.current = source;
+    source.buffer = audioBuffer;
+    source.connect(audioContext.destination);
+    
+    source.onended = () => {
+      if(audioSourceRef.current === source) audioSourceRef.current = null;
+      isPlayingRef.current = false;
+      void drainPlaybackQueue();
+    }
+
+    if (userSpeakingRef.current || utteranceAbortedRef.current) return false; // if the user is speaking, don't start the audio source
+    source.start();
+    return true;
+  }
+
+  function maybeFinishTurn() {
+    if (!turnEndedRef.current) return;
+    if (isPlayingRef.current) return;
+    if (playBackQueueRef.current.length > 0) return;
+    removeAudioSource(); // safe: idle + queue empty + turn over
   }
 
   async function createVAD(){
-
+    
     const vad = await MicVAD.new({
       model: "v5",     
       baseAssetPath: "/vad/",
@@ -357,86 +236,50 @@ function Panel() {
         isPlayingRef.current = false;
         turnEndedRef.current = false;
         removeAudioSource();
-        const dc = dcRef.current;
-        sendOrQueueControl(dc, 'interrupt');
+        sendControl('interrupt');
       },
       onSpeechEnd: () => {
         console.log("Speech ended");
         userSpeakingRef.current = false;
-        const dc = dcRef.current;
-        sendOrQueueControl(dc, 'resume');
+        sendControl('resume');
       }
     });
 
     return vad;
 
+}
+
+  function cleanupAudioState(){
+    sampleRate.current = null;
+    channels.current = null;
+    sampleWidth.current = null;
   }
 
-  async function handleStart() {
-    try {
-      // verify if there is an active session
-      if (pcRef.current && streamRef.current && isSession){
+  function enqueueAudio(merged: Uint8Array, sampleRate: number, channels: number){
+    if (merged.length === 0) return;
+    playBackQueueRef.current.push({
+      bytes: merged,
+      sampleRate: sampleRate,
+      channels: channels,
+    });
+    void drainPlaybackQueue();
+  }
 
-        // unmute the microphone
-        for (const t of streamRef.current.getAudioTracks()){
-          t.enabled = true;
-        }
-
-        // check if vad is already initialized
-        if (!vadRef.current){
-          vadRef.current = await createVAD();
-        }
-        await vadRef.current.start();
-
-        setIsSendingAudio(true);
-        setStatus('Recording… Audio is being sent to the server.');
-        return;
-
-      }
-
-      const stream = await getStream();
-
-      setStatus('Creating offer…');
-      const pc = new RTCPeerConnection();
-      pcRef.current = pc;
-      pc.addTrack(stream.getAudioTracks()[0], stream);
-
-      // data channel for voice agent 
-      const dc = pc.createDataChannel('voice-agent', { ordered: true });
-      attachDataChannel(dc, dcRef);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      // check if vad is already initialized
-      if (!vadRef.current){
-        vadRef.current = await createVAD();
-      }
-      await vadRef.current.start();
-
-      const response = await fetch(OFFER_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sdp: pc.localDescription!.sdp,
-          type: pc.localDescription!.type,
-        }),
-      });
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error((err as { error?: string }).error || response.statusText);
-      }
-
-      const answer = await response.json();
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-
-      setIsSession(true);
-      setIsSendingAudio(true);
-      setStatus('Recording… Audio is being sent to the server.');
-    } catch (err) {
-      setStatus('Stopped.');
-      await cleanup();
+  async function drainPlaybackQueue() {
+    if (isPlayingRef.current) return;
+    if (userSpeakingRef.current || utteranceAbortedRef.current) return;
+  
+    const next = playBackQueueRef.current.shift();
+    if (!next) {
+      maybeFinishTurn();
+      return;
+    }
+  
+    isPlayingRef.current = true;
+    const started = await playOneSentence(next.bytes, next.sampleRate, next.channels);
+    if (!started) {
+      isPlayingRef.current = false;
+      void drainPlaybackQueue(); // try next item or finish
     }
   }
 
@@ -445,8 +288,7 @@ function Panel() {
     if(vad){
       await vad.pause();
     }
-    const dc = dcRef.current;
-    sendOrQueueControl(dc, 'resume');
+    sendControl('resume');
     setIsSendingAudio(false);
     isReceivingAudioRef.current = false;
     utteranceAbortedRef.current = false;
